@@ -1,34 +1,26 @@
 require("dotenv").config();
 const TelegramBot = require("node-telegram-bot-api");
-// const cron = require("node-cron"); // Для периодической проверки запланированных задач
+const { DateTime } = require("luxon");
 
-// Токен бота, который получили от BotFather
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const channel = process.env.CHANNEL;
-
-// Инициализация бота (polling для обработки сообщений и callback-запросов)
-const bot = new TelegramBot(token, { polling: true });
-
-// Список разрешённых пользователей (ID можно узнать, например, через console.log(msg))
 const allowedUsers = process.env.ALLOWED_USERS
   ? process.env.ALLOWED_USERS.split(",").map((id) => Number(id.trim()))
-  : []; // замените на реальные ID пользователей
+  : [];
 
-// Хранение состояний пользователей для диалога по планированию (по chatId)
+const bot = new TelegramBot(token, { polling: true });
+
 const userStates = {};
-
-// Хранение запланированных сообщений для каждого chatId
 const scheduledMessages = {};
 let scheduledIdCounter = 1;
 
-/**
- * Функция для планирования отправки сообщения через setTimeout.
- * Добавляет в список scheduledMessages соответствующий объект.
- */
+function isUserAllowed(userId) {
+  return allowedUsers.includes(userId);
+}
+
 function scheduleMessage(postText, scheduleDate, chatId) {
   const now = new Date();
   const delay = scheduleDate - now;
-
   if (delay <= 0) {
     bot.sendMessage(chatId, "Выбранное время уже прошло.");
     return;
@@ -39,64 +31,44 @@ function scheduleMessage(postText, scheduleDate, chatId) {
     bot
       .sendMessage(channel, postText)
       .then(() => {
-        console.log(`Пост (id: ${id}) успешно отправлен`);
         if (scheduledMessages[chatId]) {
           scheduledMessages[chatId] = scheduledMessages[chatId].filter(
             (item) => item.id !== id
           );
         }
+        console.log(`Пост ID ${id} отправлен.`);
       })
       .catch((err) => console.error("Ошибка при отправке поста:", err));
   }, delay);
 
-  if (!scheduledMessages[chatId]) {
-    scheduledMessages[chatId] = [];
-  }
-
-  scheduledMessages[chatId].push({
-    id,
-    timerId,
-    scheduleDate,
-    postText,
-  });
-
+  if (!scheduledMessages[chatId]) scheduledMessages[chatId] = [];
+  scheduledMessages[chatId].push({ id, timerId, scheduleDate, postText });
   return id;
 }
 
-// Проверка наличия пользователя в списке разрешённых
-function isUserAllowed(userId) {
-  return allowedUsers.includes(userId);
-}
+bot.onText(/\/myid/, (msg) => {
+  bot.sendMessage(msg.chat.id, `Ваш userId: ${msg.from.id}`);
+});
 
-// Команда для начала планирования поста
 bot.onText(/\/schedule/, (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
 
-  // Если пользователь не разрешён, отправляем сообщение об отказе
   if (!isUserAllowed(userId)) {
-    bot.sendMessage(
-      chatId,
-      "Извините, у вас нет прав на планирование сообщений."
-    );
+    bot.sendMessage(chatId, "У вас нет прав на планирование сообщений.");
     return;
   }
 
-  bot.sendMessage(chatId, "Введите текст поста, который нужно запланировать:");
+  bot.sendMessage(chatId, "Введите текст поста:");
   userStates[chatId] = { step: "awaiting_text" };
 });
 
-// Команда для вывода списка запланированных сообщений
 bot.onText(/\/list/, (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
 
-  // Ограничение: выводим список только разрешённым пользователям
   if (!isUserAllowed(userId)) {
-    bot.sendMessage(
-      chatId,
-      "Извините, у вас нет прав на просмотр запланированных сообщений."
-    );
+    bot.sendMessage(chatId, "У вас нет прав на просмотр сообщений.");
     return;
   }
 
@@ -108,9 +80,9 @@ bot.onText(/\/list/, (msg) => {
 
   const textLines = items.map(
     (item) =>
-      `ID: ${item.id} \nДата: ${item.scheduleDate.toLocaleString()} \nТекст: ${
-        item.postText
-      }`
+      `ID: ${item.id}\nДата: ${DateTime.fromJSDate(item.scheduleDate)
+        .setZone("Asia/Bishkek")
+        .toFormat("yyyy-MM-dd HH:mm")}\nТекст: ${item.postText}`
   );
 
   const inlineKeyboard = items.map((item) => [
@@ -120,56 +92,38 @@ bot.onText(/\/list/, (msg) => {
   bot.sendMessage(
     chatId,
     "Список запланированных сообщений:\n\n" + textLines.join("\n\n"),
-    { reply_markup: { inline_keyboard } }
+    { reply_markup: { inline_keyboard: inlineKeyboard } }
   );
 });
 
-// Команда для отмены сообщения (/cancel доступна через callback_inline кнопки, обработка ниже)
-// Если нужна отдельная команда, можно добавить ещё обработку, аналогичную /list.
-
-/* Обработка callback-запросов (отмена, выбор даты/времени и т.д.) */
 bot.on("callback_query", (callbackQuery) => {
   const chatId = callbackQuery.message.chat.id;
   const data = callbackQuery.data;
+  const state = userStates[chatId];
 
-  // Обработка отмены по кнопке: callback_data вида "cancel_{id}"
   if (data.startsWith("cancel_")) {
-    const idToCancel = Number(data.split("_")[1]);
-    if (scheduledMessages[chatId]) {
-      const msgIndex = scheduledMessages[chatId].findIndex(
-        (item) => item.id === idToCancel
-      );
-      if (msgIndex >= 0) {
-        const [cancelled] = scheduledMessages[chatId].splice(msgIndex, 1);
-        clearTimeout(cancelled.timerId);
-        bot.sendMessage(
-          chatId,
-          `Запланированное сообщение с ID ${idToCancel} отменено.`
-        );
-      } else {
-        bot.sendMessage(chatId, "Сообщение с указанным ID не найдено.");
-      }
+    const id = Number(data.split("_")[1]);
+    const index = scheduledMessages[chatId]?.findIndex(
+      (item) => item.id === id
+    );
+    if (index >= 0) {
+      clearTimeout(scheduledMessages[chatId][index].timerId);
+      scheduledMessages[chatId].splice(index, 1);
+      bot.sendMessage(chatId, `Сообщение с ID ${id} отменено.`);
     } else {
-      bot.sendMessage(chatId, "Нет запланированных сообщений.");
+      bot.sendMessage(chatId, "Сообщение не найдено.");
     }
     bot.answerCallbackQuery(callbackQuery.id);
     return;
   }
 
-  // Здесь может идти обработка других callback-данных (выбор даты и времени, ручной ввод и т.д.)
-  const state = userStates[chatId];
   if (!state) return;
 
   if (state.step === "awaiting_date" && data.startsWith("date_")) {
-    let selectedDate = new Date();
-    if (data === "date_today") {
-      // текущая дата
-    } else if (data === "date_tomorrow") {
-      selectedDate.setDate(selectedDate.getDate() + 1);
-    } else if (data === "date_day_after") {
-      selectedDate.setDate(selectedDate.getDate() + 2);
-    }
-    state.selectedDate = selectedDate;
+    let date = DateTime.now().setZone("Asia/Bishkek");
+    if (data === "date_tomorrow") date = date.plus({ days: 1 });
+    if (data === "date_day_after") date = date.plus({ days: 2 });
+    state.selectedDate = date;
     state.step = "awaiting_time";
 
     const timeOptions = {
@@ -190,8 +144,8 @@ bot.on("callback_query", (callbackQuery) => {
       },
     };
 
-    bot.sendMessage(chatId, "Выберите время для отправки поста:", timeOptions);
-    bot.answerCallbackQuery(callbackQuery.id, { text: "Дата выбрана" });
+    bot.sendMessage(chatId, "Выберите время:", timeOptions);
+    bot.answerCallbackQuery(callbackQuery.id);
     return;
   }
 
@@ -200,42 +154,41 @@ bot.on("callback_query", (callbackQuery) => {
     data.startsWith("time_") &&
     data !== "time_manual"
   ) {
-    const timeStr = data.split("_")[1];
-    const [hours, minutes] = timeStr.split(":").map(Number);
-    const scheduleDate = new Date(state.selectedDate);
-    scheduleDate.setHours(hours, minutes, 0, 0);
+    const [hours, minutes] = data.split("_")[1].split(":").map(Number);
+    const scheduleDate = state.selectedDate
+      .set({ hour: hours, minute: minutes })
+      .toJSDate();
 
     bot.sendMessage(
       chatId,
-      `Пост запланирован на ${scheduleDate.toLocaleString()}`
+      `Пост запланирован на ${DateTime.fromJSDate(scheduleDate)
+        .setZone("Asia/Bishkek")
+        .toFormat("yyyy-MM-dd HH:mm")}`
     );
     scheduleMessage(state.postText, scheduleDate, chatId);
     delete userStates[chatId];
-    bot.answerCallbackQuery(callbackQuery.id, { text: "Время выбрано" });
+    bot.answerCallbackQuery(callbackQuery.id);
     return;
   }
 
   if (state.step === "awaiting_time" && data === "time_manual") {
     state.step = "awaiting_manual_time";
     bot.sendMessage(chatId, "Введите время в формате HH:MM (например, 15:45):");
-    bot.answerCallbackQuery(callbackQuery.id, {
-      text: "Введите время вручную",
-    });
-    return;
+    bot.answerCallbackQuery(callbackQuery.id);
   }
 });
 
-// Обработка текстовых сообщений для этапа ручного ввода времени
 bot.on("message", (msg) => {
   const chatId = msg.chat.id;
-  if (!userStates[chatId] || msg.text.startsWith("/")) return;
+  const text = msg.text;
+  if (!userStates[chatId] || text.startsWith("/")) return;
 
   const state = userStates[chatId];
 
   if (state.step === "awaiting_text") {
-    state.postText = msg.text;
+    state.postText = text;
     state.step = "awaiting_date";
-    const options = {
+    const dateOptions = {
       reply_markup: {
         inline_keyboard: [
           [
@@ -246,29 +199,29 @@ bot.on("message", (msg) => {
         ],
       },
     };
-    bot.sendMessage(chatId, "Выберите дату для отправки поста:", options);
+    bot.sendMessage(chatId, "Выберите дату:", dateOptions);
     return;
   }
 
   if (state.step === "awaiting_manual_time") {
-    const timeInput = msg.text;
-    const timePattern = /^([01]\d|2[0-3]):([0-5]\d)$/;
-    if (!timePattern.test(timeInput)) {
-      bot.sendMessage(
-        chatId,
-        "Неверный формат времени. Введите время в формате HH:MM (например, 15:45)."
-      );
+    const match = text.match(/^([01]\d|2[0-3]):([0-5]\d)$/);
+    if (!match) {
+      bot.sendMessage(chatId, "Формат времени неверный. Пример: 15:45");
       return;
     }
-    const [hours, minutes] = timeInput.split(":").map(Number);
-    const scheduleDate = new Date(state.selectedDate);
-    scheduleDate.setHours(hours, minutes, 0, 0);
+
+    const [hours, minutes] = match.slice(1).map(Number);
+    const scheduleDate = state.selectedDate
+      .set({ hour: hours, minute: minutes })
+      .toJSDate();
+
     bot.sendMessage(
       chatId,
-      `Пост запланирован на ${scheduleDate.toLocaleString()}`
+      `Пост запланирован на ${DateTime.fromJSDate(scheduleDate)
+        .setZone("Asia/Bishkek")
+        .toFormat("yyyy-MM-dd HH:mm")}`
     );
     scheduleMessage(state.postText, scheduleDate, chatId);
     delete userStates[chatId];
-    return;
   }
 });
